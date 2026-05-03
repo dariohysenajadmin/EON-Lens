@@ -177,3 +177,5 @@ def stream_response(
 def _clock(seconds: float) -> str:
     s = int(seconds)
     return f"{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
+    # Streamlit Cloud entry-point redirect (deploy was set to lens_ai.py instead of app.py)
+import app  # noqa: F401
