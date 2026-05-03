@@ -222,11 +222,6 @@ with st.sidebar:
     st.markdown('<div class="lens-brand"><span class="lens-dot"></span>Lens</div>', unsafe_allow_html=True)
     st.markdown('<div class="lens-tagline">Video intelligence for marketing & product teams.</div>', unsafe_allow_html=True)
 
-    theme_choice = st.radio("Theme", options=["dark", "light"], index=0 if st.session_state.theme == "dark" else 1, horizontal=True, key="theme_radio")
-    if theme_choice != st.session_state.theme:
-        st.session_state.theme = theme_choice
-        st.rerun()
-
     st.markdown("---")
 
     with st.expander("API key", expanded=not st.session_state.groq_key):
