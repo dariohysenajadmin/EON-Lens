@@ -22,6 +22,10 @@ from pathlib import Path
 from typing import Callable, Optional
 
 
+# YouTube extractor args - bypasses JS runtime requirement on cloud envs
+YT_EXTRACTOR_ARGS = "youtube:player_client=tv,web_safari,mweb"
+
+
 @dataclass
 class VideoCue:
     start: float
@@ -156,7 +160,8 @@ def _resolve_source(source, tmpdir, say):
 def _download_url(url, tmpdir, say):
     say("Fetching video metadata via yt-dlp...")
     meta_proc = subprocess.run(
-        ["yt-dlp", "--dump-json", "--no-playlist", "--skip-download", url],
+        ["yt-dlp", "--dump-json", "--no-playlist", "--skip-download",
+         "--extractor-args", YT_EXTRACTOR_ARGS, url],
         capture_output=True, text=True,
     )
     if meta_proc.returncode != 0:
@@ -172,6 +177,7 @@ def _download_url(url, tmpdir, say):
         ["yt-dlp", "-f", "bv*[height<=720]+ba/b[height<=720]/best",
          "--merge-output-format", "mp4", "--write-auto-subs", "--write-subs",
          "--sub-langs", "en,en-orig,en-US", "--sub-format", "vtt",
+         "--extractor-args", YT_EXTRACTOR_ARGS,
          "--no-playlist", "-o", out_template, url],
         capture_output=True, text=True,
     )
@@ -179,8 +185,9 @@ def _download_url(url, tmpdir, say):
         say("Subtitles unavailable - retrying without captions...")
         dl = subprocess.run(
             ["yt-dlp", "-f", "bv*[height<=720]+ba/b[height<=720]/best",
-             "--merge-output-format", "mp4", "--no-playlist",
-             "-o", out_template, url],
+             "--merge-output-format", "mp4",
+             "--extractor-args", YT_EXTRACTOR_ARGS,
+             "--no-playlist", "-o", out_template, url],
             capture_output=True, text=True,
         )
         if dl.returncode != 0:
