@@ -164,7 +164,7 @@ def _try_supadata(url, tmpdir, say):
         say(f"Supadata HTTP error: {e}")
         return None
 
-    if r.status_code != 200:
+    if r.status_code not in (200, 202):
         say(f"Supadata returned HTTP {r.status_code}: {r.text[:300]}")
         return None
 
@@ -174,7 +174,7 @@ def _try_supadata(url, tmpdir, say):
         say(f"Supadata JSON parse failed: {e}; body: {r.text[:200]}")
         return None
 
-    # Async job: Supadata returns {"jobId": "..."} for long videos that need ASR
+    # Async job: HTTP 202 + {"jobId": "..."} means audio is being transcribed via Whisper
     if "jobId" in data and not (data.get("content") or data.get("transcript")):
         job_id = data["jobId"]
         say(f"Supadata is transcribing audio via Whisper (job {job_id[:8]}...). This may take 30-120s.")
