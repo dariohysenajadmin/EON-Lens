@@ -1,11 +1,8 @@
 """
 lens_video.py - video extraction library for Lens.
 
-Two paths for URLs:
-  - YouTube URLs: use youtube-transcript-api + public thumbnail CDN
-    (avoids yt-dlp + IP blocking on cloud servers)
-  - Other URLs: use yt-dlp (Loom, Vimeo, MP4 links, etc.)
-  - Local files: use ffmpeg directly
+YouTube URLs route through Supadata API (bypasses cloud-IP blocking).
+Other URLs use yt-dlp. Local files use ffmpeg directly.
 """
 
 from __future__ import annotations
@@ -96,17 +93,14 @@ def extract_video_data(source, *, max_frames=30, start=0.0, end=None,
         _say("Building transcript...")
         cues, transcript_source = _build_transcript(meta, tmpdir, _say)
 
-        if meta.get("is_youtube_api"):
+        if meta.get("is_supadata"):
             _say("Using YouTube thumbnail as visual reference...")
-            frames = _frames_from_thumbnail(meta["thumbnail_path"], frames_dir, duration)
+            frames = _frames_from_thumbnail(meta["thumbnail_path"], frames_dir)
         else:
             _say(f"Extracting up to {max_frames} frames...")
             frames = _extract_frames(
-                video_path=meta["video_path"],
-                duration=duration,
-                start=start_t,
-                end=end_t,
-                max_frames=max_frames,
+                video_path=meta["video_path"], duration=duration,
+                start=start_t, end=end_t, max_frames=max_frames,
                 frames_dir=frames_dir,
             )
 
@@ -129,43 +123,76 @@ def extract_video_data(source, *, max_frames=30, start=0.0, end=None,
 def _resolve_source(source, tmpdir, say):
     if source.startswith(("http://", "https://", "www.")):
         if "youtube.com" in source or "youtu.be" in source:
-            yt = _try_youtube_api(source, tmpdir, say)
+            yt = _try_supadata(source, tmpdir, say)
             if yt:
                 return yt
-            say("YouTube API path failed, trying yt-dlp fallback...")
+            say("Supadata failed, trying yt-dlp fallback...")
         return _download_url(source, tmpdir, say)
 
     p = Path(source).expanduser().resolve()
     if not p.exists():
         raise FileNotFoundError(f"Local file not found: {source}")
-    if not shutil.which("ffprobe"):
-        raise RuntimeError("ffprobe not installed.")
     duration = _probe_duration(p)
     return {"title": p.stem, "video_id": _slugify(p.stem),
             "duration": duration, "video_path": p, "captions_path": None}
 
 
-def _try_youtube_api(url, tmpdir, say):
-    """Fetch YouTube transcript via youtube-transcript-api + public thumbnail."""
+def _try_supadata(url, tmpdir, say):
+    """Fetch YouTube transcript via Supadata API + thumbnail from public CDN."""
+    api_key = os.environ.get("SUPADATA_API_KEY")
+    if not api_key:
+        say("SUPADATA_API_KEY not set - skipping Supadata.")
+        return None
+
     m = re.search(r"(?:v=|/embed/|/shorts/|/v/|youtu\.be/)([0-9A-Za-z_-]{11})", url)
     if not m:
         return None
     yt_id = m.group(1)
 
-    say(f"Fetching YouTube transcript for {yt_id}...")
+    say(f"Fetching transcript via Supadata for {yt_id}...")
+    import requests
     try:
-        from youtube_transcript_api import YouTubeTranscriptApi
-        segments = YouTubeTranscriptApi.get_transcript(yt_id, languages=["en", "en-US", "en-GB"])
+        r = requests.get(
+            "https://api.supadata.ai/v1/youtube/transcript",
+            params={"url": url, "text": "false"},
+            headers={"x-api-key": api_key},
+            timeout=60,
+        )
     except Exception as e:
-        say(f"Transcript fetch failed: {e}")
+        say(f"Supadata request failed: {e}")
         return None
 
-    import requests
+    if r.status_code != 200:
+        say(f"Supadata returned {r.status_code}: {r.text[:200]}")
+        return None
+
+    data = r.json()
+    segments = data.get("content") or data.get("transcript") or []
+    if not segments:
+        say("Supadata returned no transcript segments.")
+        return None
+
+    cues = []
+    for s in segments:
+        start = s.get("offset", s.get("start", 0)) / 1000.0 if "offset" in s else s.get("start", 0.0)
+        duration = s.get("duration", 2.0) / 1000.0 if isinstance(s.get("duration"), (int, float)) and s.get("duration", 0) > 100 else s.get("duration", 2.0)
+        end = start + duration
+        text = s.get("text", "").strip()
+        if text:
+            cues.append(VideoCue(start=start, end=end, text=text))
+
+    if not cues:
+        return None
+
+    total_duration = cues[-1].end
+
     title = yt_id
     try:
-        r = requests.get(f"https://www.youtube.com/oembed?url={url}&format=json", timeout=10)
-        if r.status_code == 200:
-            title = r.json().get("title", yt_id)
+        oembed = requests.get(
+            f"https://www.youtube.com/oembed?url={url}&format=json", timeout=10
+        )
+        if oembed.status_code == 200:
+            title = oembed.json().get("title", yt_id)
     except Exception:
         pass
 
@@ -173,34 +200,31 @@ def _try_youtube_api(url, tmpdir, say):
     thumb_path = tmpdir / f"{yt_id}_thumb.jpg"
     for variant in ("maxresdefault", "sddefault", "hqdefault", "mqdefault"):
         try:
-            r = requests.get(f"https://img.youtube.com/vi/{yt_id}/{variant}.jpg", timeout=15)
-            if r.status_code == 200 and len(r.content) > 1000:
-                thumb_path.write_bytes(r.content)
+            tr = requests.get(f"https://img.youtube.com/vi/{yt_id}/{variant}.jpg", timeout=15)
+            if tr.status_code == 200 and len(tr.content) > 1000:
+                thumb_path.write_bytes(tr.content)
                 break
         except Exception:
             continue
     if not thumb_path.exists():
         return None
 
-    duration = (segments[-1]["start"] + segments[-1].get("duration", 2.0)) if segments else 0.0
-
     captions_path = tmpdir / f"{yt_id}.vtt"
-    _write_segments_as_vtt(segments, captions_path)
+    _write_cues_as_vtt(cues, captions_path)
 
     return {
-        "title": title, "video_id": yt_id, "duration": duration,
+        "title": title, "video_id": yt_id, "duration": total_duration,
         "video_path": None, "captions_path": captions_path,
-        "thumbnail_path": thumb_path, "is_youtube_api": True,
+        "thumbnail_path": thumb_path, "is_supadata": True,
+        "preloaded_cues": cues,
     }
 
 
-def _write_segments_as_vtt(segments, path):
+def _write_cues_as_vtt(cues, path):
     lines = ["WEBVTT", ""]
-    for s in segments:
-        start = s["start"]
-        end = start + s.get("duration", 2.0)
-        lines.append(f"{_vtt_time(start)} --> {_vtt_time(end)}")
-        lines.append(s["text"].replace("\n", " "))
+    for c in cues:
+        lines.append(f"{_vtt_time(c.start)} --> {_vtt_time(c.end)}")
+        lines.append(c.text.replace("\n", " "))
         lines.append("")
     path.write_text("\n".join(lines), encoding="utf-8")
 
@@ -212,8 +236,7 @@ def _vtt_time(seconds):
     return f"{h:02d}:{m:02d}:{s:06.3f}"
 
 
-def _frames_from_thumbnail(thumb_path, frames_dir, duration):
-    """When we only have a thumbnail (YouTube API path), use it as a single frame."""
+def _frames_from_thumbnail(thumb_path, frames_dir):
     out_path = frames_dir / "frame_0001_00m00s.jpg"
     shutil.copy(str(thumb_path), str(out_path))
     with out_path.open("rb") as fh:
@@ -286,12 +309,14 @@ def _probe_duration(path):
 
 
 def _build_transcript(meta, tmpdir, say):
+    if meta.get("preloaded_cues"):
+        return meta["preloaded_cues"], "youtube_captions"
     captions_path = meta.get("captions_path")
     if captions_path and Path(captions_path).exists():
         say("Using captions...")
         cues = _parse_vtt(Path(captions_path))
         if cues:
-            return cues, "youtube_captions" if meta.get("is_youtube_api") else "captions"
+            return cues, "captions"
     if not meta.get("video_path"):
         return [], "none"
     say("Extracting audio for Whisper transcription...")
