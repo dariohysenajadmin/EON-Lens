@@ -1,12 +1,12 @@
 """
 lens_video.py - video extraction library for Lens.
- 
+
 YouTube URLs route through Supadata API (bypasses cloud-IP blocking).
 Other URLs use yt-dlp. Local files use ffmpeg directly.
 """
- 
+
 from __future__ import annotations
- 
+
 import base64
 import json
 import os
@@ -18,29 +18,29 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
- 
- 
+
+
 @dataclass
 class VideoCue:
     start: float
     end: float
     text: str
- 
+
     def clock(self) -> str:
         return _fmt_clock(self.start)
- 
- 
+
+
 @dataclass
 class VideoFrame:
     index: int
     timestamp: float
     path: Path
     base64_jpeg: str
- 
+
     def clock(self) -> str:
         return _fmt_clock(self.timestamp)
- 
- 
+
+
 @dataclass
 class VideoData:
     title: str
@@ -50,7 +50,7 @@ class VideoData:
     frames: list
     transcript_source: str
     work_dir: Path
- 
+
     def transcript_text(self, start: float = 0.0, end: Optional[float] = None) -> str:
         end = end if end is not None else self.duration
         lines = []
@@ -59,40 +59,40 @@ class VideoData:
                 continue
             lines.append(f"[{cue.clock()}] {cue.text}")
         return "\n".join(lines)
- 
+
     def frame_grid_base64(self, max_size_kb: int = 3500):
         from lens_grid import build_frame_grid
         return build_frame_grid(self.frames, max_size_kb=max_size_kb)
- 
- 
+
+
 def extract_video_data(source, *, max_frames=30, start=0.0, end=None,
                       output_root="data", progress=None):
     output_root = Path(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
- 
+
     def _say(msg):
         if progress:
             progress(msg)
- 
+
     with tempfile.TemporaryDirectory(prefix="lens-dl-") as tmp:
         tmpdir = Path(tmp)
         _say("Resolving video source...")
         meta = _resolve_source(source, tmpdir, _say)
- 
+
         out_dir = output_root / meta["video_id"]
         out_dir.mkdir(parents=True, exist_ok=True)
         frames_dir = out_dir / "frames"
         frames_dir.mkdir(parents=True, exist_ok=True)
- 
+
         duration = meta["duration"]
         end_t = duration if end is None else min(end, duration)
         start_t = max(0.0, start)
         if end_t <= start_t:
             end_t = duration
- 
+
         _say("Building transcript...")
         cues, transcript_source = _build_transcript(meta, tmpdir, _say)
- 
+
         if meta.get("is_supadata"):
             _say("Using YouTube thumbnail as visual reference...")
             frames = _frames_from_thumbnail(meta["thumbnail_path"], frames_dir)
@@ -103,7 +103,7 @@ def extract_video_data(source, *, max_frames=30, start=0.0, end=None,
                 start=start_t, end=end_t, max_frames=max_frames,
                 frames_dir=frames_dir,
             )
- 
+
     meta_blob = {
         "title": meta["title"], "source": source, "duration": duration,
         "transcript_source": transcript_source,
@@ -111,15 +111,15 @@ def extract_video_data(source, *, max_frames=30, start=0.0, end=None,
         "extracted_at": int(time.time()),
     }
     (out_dir / "metadata.json").write_text(json.dumps(meta_blob, indent=2))
- 
+
     _say("Done.")
     return VideoData(
         title=meta["title"], source=source, duration=duration,
         transcript=cues, frames=frames,
         transcript_source=transcript_source, work_dir=out_dir,
     )
- 
- 
+
+
 def _resolve_source(source, tmpdir, say):
     if source.startswith(("http://", "https://", "www.")):
         if "youtube" in source or "youtu.be" in source:
@@ -128,58 +128,66 @@ def _resolve_source(source, tmpdir, say):
                 return yt
             say("Supadata failed, trying yt-dlp fallback...")
         return _download_url(source, tmpdir, say)
- 
+
     p = Path(source).expanduser().resolve()
     if not p.exists():
         raise FileNotFoundError(f"Local file not found: {source}")
     duration = _probe_duration(p)
     return {"title": p.stem, "video_id": _slugify(p.stem),
             "duration": duration, "video_path": p, "captions_path": None}
- 
- 
+
+
 def _try_supadata(url, tmpdir, say):
     api_key = os.environ.get("SUPADATA_API_KEY")
     if not api_key:
         say("SUPADATA_API_KEY env var is EMPTY - check Streamlit secrets.")
         return None
     say(f"Supadata key present (len={len(api_key)}, starts {api_key[:4]}...).")
- 
+
     m = re.search(r"(?:v=|/embed/|/shorts/|/v/|youtu\.be/)([0-9A-Za-z_-]{11})", url)
     if not m:
         say("Could not parse YouTube ID from URL.")
         return None
     yt_id = m.group(1)
- 
-    say(f"Calling Supadata API for {yt_id}...")
+
+    say(f"Calling Supadata universal transcript API (mode=auto) for {yt_id}...")
     import requests
-    endpoint = "https://api.supadata.ai/v1/youtube/transcript"
+    endpoint = "https://api.supadata.ai/v1/transcript"
     try:
         r = requests.get(
             endpoint,
-            params={"url": url, "text": "false"},
+            params={"url": url, "mode": "auto", "text": "false"},
             headers={"x-api-key": api_key},
             timeout=60,
         )
     except Exception as e:
         say(f"Supadata HTTP error: {e}")
         return None
- 
+
     if r.status_code != 200:
         say(f"Supadata returned HTTP {r.status_code}: {r.text[:300]}")
         return None
- 
+
     try:
         data = r.json()
     except Exception as e:
         say(f"Supadata JSON parse failed: {e}; body: {r.text[:200]}")
         return None
- 
+
+    # Async job: Supadata returns {"jobId": "..."} for long videos that need ASR
+    if "jobId" in data and not (data.get("content") or data.get("transcript")):
+        job_id = data["jobId"]
+        say(f"Supadata is transcribing audio via Whisper (job {job_id[:8]}...). This may take 30-120s.")
+        data = _supadata_poll_job(job_id, api_key, say)
+        if not data:
+            return None
+
     segments = data.get("content") or data.get("transcript") or []
     if not segments:
         say(f"Supadata returned no segments. Keys: {list(data.keys())}")
         return None
     say(f"Supadata returned {len(segments)} transcript segments.")
- 
+
     cues = []
     for s in segments:
         offset = s.get("offset")
@@ -196,12 +204,12 @@ def _try_supadata(url, tmpdir, say):
         text = (s.get("text") or "").strip()
         if text:
             cues.append(VideoCue(start=start_s, end=end_s, text=text))
- 
+
     if not cues:
         return None
- 
+
     total_duration = cues[-1].end
- 
+
     title = yt_id
     try:
         oembed = requests.get(
@@ -211,7 +219,7 @@ def _try_supadata(url, tmpdir, say):
             title = oembed.json().get("title", yt_id)
     except Exception:
         pass
- 
+
     say("Fetching thumbnail...")
     thumb_path = tmpdir / f"{yt_id}_thumb.jpg"
     for variant in ("maxresdefault", "sddefault", "hqdefault", "mqdefault"):
@@ -224,18 +232,50 @@ def _try_supadata(url, tmpdir, say):
             continue
     if not thumb_path.exists():
         return None
- 
+
     captions_path = tmpdir / f"{yt_id}.vtt"
     _write_cues_as_vtt(cues, captions_path)
- 
+
     return {
         "title": title, "video_id": yt_id, "duration": total_duration,
         "video_path": None, "captions_path": captions_path,
         "thumbnail_path": thumb_path, "is_supadata": True,
         "preloaded_cues": cues,
     }
- 
- 
+
+
+def _supadata_poll_job(job_id, api_key, say, max_wait=180, interval=4):
+    import requests
+    endpoint = f"https://api.supadata.ai/v1/transcript/{job_id}"
+    waited = 0
+    while waited < max_wait:
+        try:
+            r = requests.get(endpoint, headers={"x-api-key": api_key}, timeout=30)
+        except Exception as e:
+            say(f"Supadata job poll error: {e}")
+            return None
+        if r.status_code != 200:
+            say(f"Supadata job poll HTTP {r.status_code}: {r.text[:200]}")
+            return None
+        try:
+            data = r.json()
+        except Exception as e:
+            say(f"Supadata job poll JSON error: {e}")
+            return None
+        status = (data.get("status") or "").lower()
+        if data.get("content") or data.get("transcript") or status == "completed":
+            return data
+        if status in ("failed", "error"):
+            err = data.get("error") or data.get("message") or str(data)[:200]
+            say(f"Supadata job failed: {err}")
+            return None
+        say(f"Still transcribing... ({waited}s elapsed, status: {status or 'queued'})")
+        time.sleep(interval)
+        waited += interval
+    say(f"Supadata job timed out after {max_wait}s.")
+    return None
+
+
 def _write_cues_as_vtt(cues, path):
     lines = ["WEBVTT", ""]
     for c in cues:
@@ -243,23 +283,23 @@ def _write_cues_as_vtt(cues, path):
         lines.append(c.text.replace("\n", " "))
         lines.append("")
     path.write_text("\n".join(lines), encoding="utf-8")
- 
- 
+
+
 def _vtt_time(seconds):
     h = int(seconds // 3600)
     m = int((seconds % 3600) // 60)
     s = seconds % 60
     return f"{h:02d}:{m:02d}:{s:06.3f}"
- 
- 
+
+
 def _frames_from_thumbnail(thumb_path, frames_dir):
     out_path = frames_dir / "frame_0001_00m00s.jpg"
     shutil.copy(str(thumb_path), str(out_path))
     with out_path.open("rb") as fh:
         b64 = base64.standard_b64encode(fh.read()).decode("ascii")
     return [VideoFrame(index=1, timestamp=0.0, path=out_path, base64_jpeg=b64)]
- 
- 
+
+
 def _download_url(url, tmpdir, say):
     if not shutil.which("yt-dlp"):
         raise RuntimeError("yt-dlp not installed.")
@@ -274,7 +314,7 @@ def _download_url(url, tmpdir, say):
     video_id = meta.get("id") or _slugify(meta.get("title", "video"))
     title = meta.get("title", video_id)
     duration = float(meta.get("duration") or 0.0)
- 
+
     say(f"Downloading: {title}")
     out_template = str(tmpdir / f"{video_id}.%(ext)s")
     dl = subprocess.run(
@@ -294,7 +334,7 @@ def _download_url(url, tmpdir, say):
         )
         if dl.returncode != 0:
             raise RuntimeError(f"yt-dlp download failed:\n{dl.stderr}")
- 
+
     video_path = None
     captions_path = None
     for f in tmpdir.iterdir():
@@ -310,8 +350,8 @@ def _download_url(url, tmpdir, say):
         duration = _probe_duration(video_path)
     return {"title": title, "video_id": video_id, "duration": duration,
             "video_path": video_path, "captions_path": captions_path}
- 
- 
+
+
 def _probe_duration(path):
     proc = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -322,8 +362,8 @@ def _probe_duration(path):
         return float(proc.stdout.strip())
     except ValueError:
         return 0.0
- 
- 
+
+
 def _build_transcript(meta, tmpdir, say):
     if meta.get("preloaded_cues"):
         return meta["preloaded_cues"], "youtube_captions"
@@ -350,8 +390,8 @@ def _build_transcript(meta, tmpdir, say):
     except Exception as e:
         say(f"Whisper failed: {e}")
         return [], "none"
- 
- 
+
+
 def _parse_vtt(path):
     cues = []
     text = path.read_text(encoding="utf-8", errors="replace")
@@ -376,13 +416,13 @@ def _parse_vtt(path):
             continue
         cues.append(VideoCue(start=start_s, end=end_t, text=cue_text))
     return cues
- 
- 
+
+
 def _vtt_to_seconds(stamp):
     h, m, s = stamp.split(":")
     return int(h) * 3600 + int(m) * 60 + float(s)
- 
- 
+
+
 def _whisper_groq(audio):
     api_key = os.environ.get("GROQ_API_KEY")
     if not api_key:
@@ -402,8 +442,8 @@ def _whisper_groq(audio):
     segs = resp.json().get("segments") or []
     return [VideoCue(start=float(s["start"]), end=float(s["end"]), text=s["text"].strip())
             for s in segs]
- 
- 
+
+
 def _extract_frames(*, video_path, duration, start, end, max_frames, frames_dir):
     window = max(1.0, end - start)
     target = min(max_frames, max(8, int(window // 6)))
@@ -425,13 +465,13 @@ def _extract_frames(*, video_path, duration, start, end, max_frames, frames_dir)
                 b64 = base64.standard_b64encode(fh.read()).decode("ascii")
             frames.append(VideoFrame(index=i + 1, timestamp=t, path=out_path, base64_jpeg=b64))
     return frames
- 
- 
+
+
 def _fmt_clock(seconds):
     s = int(seconds)
     return f"{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
- 
- 
+
+
 def _slugify(s, max_len=60):
     s = re.sub(r"[^a-zA-Z0-9_-]+", "-", s).strip("-").lower()
     return s[:max_len] or "video"
