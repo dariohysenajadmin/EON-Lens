@@ -88,26 +88,34 @@ header[data-testid="stHeader"] { background: transparent !important; }
   box-shadow: 0 0 0 3px var(--lens-accent-soft) !important;
 }
 
-/* Sticky chip row: target the columns block immediately after our anchor.
-   The anchor is invisible; it's just a CSS hook for :has() to find the
-   following element-container (the one that holds our 5 buttons). */
-[data-testid="stElementContainer"]:has(> .stMarkdown .lens-chip-anchor),
-[data-testid="element-container"]:has(> .stMarkdown .lens-chip-anchor) {
-  display: none;
+/* Sticky chip row: the anchor is an invisible hook. The following sibling
+   element (the one with our 5 buttons) is made sticky. Selectors are kept
+   permissive to handle different Streamlit DOM structures. */
+.lens-chip-anchor { display: block; height: 0; visibility: hidden; }
+
+/* Hide the wrapper element-container that holds the anchor */
+[data-testid="stElementContainer"]:has(.lens-chip-anchor),
+[data-testid="element-container"]:has(.lens-chip-anchor) {
+  height: 0;
+  margin: 0;
+  padding: 0;
+  overflow: visible;
 }
-[data-testid="stElementContainer"]:has(> .stMarkdown .lens-chip-anchor) + [data-testid="stElementContainer"],
-[data-testid="element-container"]:has(> .stMarkdown .lens-chip-anchor) + [data-testid="element-container"] {
+
+/* Make the next sibling sticky - whatever its data-testid is */
+[data-testid="stElementContainer"]:has(.lens-chip-anchor) + *,
+[data-testid="element-container"]:has(.lens-chip-anchor) + * {
   position: sticky;
   top: 3rem;
   z-index: 99;
-  background: rgba(15, 17, 21, 0.92);
+  background: rgba(15, 17, 21, 0.94);
   backdrop-filter: blur(14px);
   -webkit-backdrop-filter: blur(14px);
   padding: 10px 8px;
   border-radius: 12px;
   border-bottom: 1px solid rgba(212, 98, 42, 0.18);
-  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.25);
-  margin-bottom: 12px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.3);
+  margin-bottom: 14px;
 }
 </style>
 """
