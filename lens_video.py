@@ -22,8 +22,8 @@ from pathlib import Path
 from typing import Callable, Optional
 
 
-# YouTube extractor args - bypasses JS runtime requirement on cloud envs
-YT_EXTRACTOR_ARGS = "youtube:player_client=tv,web_safari,mweb"
+# YouTube extractor args - avoids JS runtime requirement and DRM-flagged clients
+YT_EXTRACTOR_ARGS = "youtube:player_client=web_safari,web_embedded,mediaconnect"
 
 
 @dataclass
