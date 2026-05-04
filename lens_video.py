@@ -150,31 +150,35 @@ def _try_supadata(url, tmpdir, say):
         return None
     yt_id = m.group(1)
 
-    say(f"Calling Supadata universal transcript API (mode=auto) for {yt_id}...")
     import requests
     endpoint = "https://api.supadata.ai/v1/transcript"
-    try:
-        r = requests.get(
-            endpoint,
-            params={"url": url, "mode": "auto", "text": "false"},
-            headers={"x-api-key": api_key},
-            timeout=60,
-        )
-    except Exception as e:
-        say(f"Supadata HTTP error: {e}")
+
+    def _call(mode):
+        say(f"Calling Supadata universal transcript API (mode={mode}) for {yt_id}...")
+        try:
+            r = requests.get(
+                endpoint,
+                params={"url": url, "mode": mode, "text": "false"},
+                headers={"x-api-key": api_key},
+                timeout=60,
+            )
+        except Exception as e:
+            say(f"Supadata HTTP error: {e}")
+            return None
+        if r.status_code not in (200, 202):
+            say(f"Supadata returned HTTP {r.status_code}: {r.text[:300]}")
+            return None
+        try:
+            return r.json()
+        except Exception as e:
+            say(f"Supadata JSON parse failed: {e}; body: {r.text[:200]}")
+            return None
+
+    data = _call("auto")
+    if data is None:
         return None
 
-    if r.status_code not in (200, 202):
-        say(f"Supadata returned HTTP {r.status_code}: {r.text[:300]}")
-        return None
-
-    try:
-        data = r.json()
-    except Exception as e:
-        say(f"Supadata JSON parse failed: {e}; body: {r.text[:200]}")
-        return None
-
-    # Async job: HTTP 202 + {"jobId": "..."} means audio is being transcribed via Whisper
+    # Async job: {"jobId": "..."} means audio is being transcribed via Whisper
     if "jobId" in data and not (data.get("content") or data.get("transcript")):
         job_id = data["jobId"]
         say(f"Supadata is transcribing audio via Whisper (job {job_id[:8]}...). This may take 30-120s.")
@@ -183,8 +187,23 @@ def _try_supadata(url, tmpdir, say):
             return None
 
     segments = data.get("content") or data.get("transcript") or []
+
+    # mode=auto returned empty - force ASR with mode=generate
     if not segments:
-        say(f"Supadata returned no segments. Keys: {list(data.keys())}")
+        say(f"mode=auto returned empty (keys: {list(data.keys())}). Forcing ASR with mode=generate...")
+        data = _call("generate")
+        if data is None:
+            return None
+        if "jobId" in data and not (data.get("content") or data.get("transcript")):
+            job_id = data["jobId"]
+            say(f"ASR job started (job {job_id[:8]}...). This may take 30-120s.")
+            data = _supadata_poll_job(job_id, api_key, say)
+            if not data:
+                return None
+        segments = data.get("content") or data.get("transcript") or []
+
+    if not segments:
+        say(f"Supadata returned no segments even with mode=generate. Keys: {list(data.keys())}. Likely quota exhausted on Supadata free tier.")
         return None
     say(f"Supadata returned {len(segments)} transcript segments.")
 
