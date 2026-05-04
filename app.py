@@ -16,14 +16,8 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from lens_video import VideoData, extract_video_data
-from lens_ai import (
-    build_assistant_turn,
-    build_followup_turn,
-    build_initial_turn,
-    build_remix_turn,
-    make_client,
-    stream_response,
-)
+import lens_ai as _ai_groq
+import lens_ai_anthropic as _ai_anthropic
 from prompts import PRESETS, Preset
 from theme import apply_theme
 
@@ -43,6 +37,8 @@ DEFAULTS = {
     "history": [],
     "display_log": [],
     "groq_key": os.environ.get("GROQ_API_KEY", ""),
+    "anthropic_key": os.environ.get("ANTHROPIC_API_KEY", ""),
+    "provider": "groq",
     "my_context": "",
     "active_preset": None,
     "pending_custom_goal": False,
@@ -52,8 +48,21 @@ DEFAULTS = {
 try:
     if not DEFAULTS["groq_key"] and "GROQ_API_KEY" in st.secrets:
         DEFAULTS["groq_key"] = st.secrets["GROQ_API_KEY"]
+    if not DEFAULTS["anthropic_key"] and "ANTHROPIC_API_KEY" in st.secrets:
+        DEFAULTS["anthropic_key"] = st.secrets["ANTHROPIC_API_KEY"]
 except (FileNotFoundError, AttributeError):
     pass
+
+
+def _ai():
+    """Return the active AI provider module based on the sidebar toggle."""
+    return _ai_anthropic if st.session_state.provider == "anthropic" else _ai_groq
+
+
+def _current_key():
+    return (st.session_state.anthropic_key
+            if st.session_state.provider == "anthropic"
+            else st.session_state.groq_key)
 
 for k, v in DEFAULTS.items():
     st.session_state.setdefault(k, v)
@@ -102,11 +111,15 @@ def _render_log_entry(entry):
 
 
 def _ensure_api_key():
-    if not st.session_state.groq_key:
+    if not _current_key():
+        provider_name = "Anthropic" if st.session_state.provider == "anthropic" else "Groq"
+        where = ("console.anthropic.com"
+                 if st.session_state.provider == "anthropic"
+                 else "console.groq.com/keys")
         st.session_state.display_log.append({
             "role": "assistant",
             "kind": "error",
-            "body": "Add your Groq API key in the sidebar to start asking questions. Free at console.groq.com/keys.",
+            "body": f"Add your {provider_name} API key in the sidebar to start. Get one at {where}.",
         })
         st.rerun()
         return False
@@ -146,7 +159,7 @@ def _run_preset(preset, user_goal=""):
         st.rerun()
         return
 
-    initial = build_initial_turn(videos=st.session_state.videos, preset=preset, user_goal=user_goal)
+    initial = _ai().build_initial_turn(videos=st.session_state.videos, preset=preset, user_goal=user_goal)
     st.session_state.history = [initial]
     st.session_state.active_preset = preset.key
 
@@ -171,7 +184,7 @@ def _run_followup(text):
             return
         _run_preset(PRESETS["custom_goal"], user_goal=text)
         return
-    turn = build_followup_turn(text)
+    turn = _ai().build_followup_turn(text)
     st.session_state.history.append(turn)
     st.session_state.display_log.append({"role": "user", "kind": "text", "body": text})
     _stream_assistant_reply()
@@ -185,15 +198,16 @@ def _run_remix():
         st.rerun()
         return
     preset = PRESETS[st.session_state.active_preset]
-    turn = build_remix_turn(preset)
+    turn = _ai().build_remix_turn(preset)
     st.session_state.history.append(turn)
     st.session_state.display_log.append({"role": "user", "kind": "text", "body": "**[Remix for my context]**"})
     _stream_assistant_reply()
 
 
 def _stream_assistant_reply():
+    ai = _ai()
     try:
-        client = make_client(st.session_state.groq_key)
+        client = ai.make_client(_current_key())
     except Exception as e:
         st.session_state.display_log.append({"role": "assistant", "kind": "error", "body": f"API key issue: {e}"})
         st.rerun()
@@ -208,7 +222,7 @@ def _stream_assistant_reply():
         placeholder = st.empty()
         accumulated = ""
         try:
-            for chunk in stream_response(
+            for chunk in ai.stream_response(
                 client=client,
                 preset=preset,
                 my_context=st.session_state.my_context,
@@ -221,7 +235,7 @@ def _stream_assistant_reply():
             placeholder.error(f"Streaming failed: {e}")
             return
 
-    st.session_state.history.append(build_assistant_turn(accumulated))
+    st.session_state.history.append(ai.build_assistant_turn(accumulated))
     st.session_state.display_log.append({"role": "assistant", "kind": "text", "body": accumulated})
 
 
@@ -231,15 +245,40 @@ with st.sidebar:
 
     st.markdown("---")
 
-    with st.expander("API key", expanded=not st.session_state.groq_key):
+    with st.expander("AI provider & keys", expanded=not _current_key()):
+        provider_choice = st.radio(
+            "Provider",
+            options=["groq", "anthropic"],
+            index=0 if st.session_state.provider == "groq" else 1,
+            format_func=lambda x: ("Groq Llama (free, fast)"
+                                    if x == "groq"
+                                    else "Anthropic Claude (paid, sharper)"),
+            help="Switch the AI brain. Anthropic gives sharper analysis with per-frame vision but costs cents per request. Groq is free.",
+        )
+        if provider_choice != st.session_state.provider:
+            # Switching providers invalidates history (different content-block formats).
+            st.session_state.provider = provider_choice
+            st.session_state.history = []
+            st.session_state.active_preset = None
+            st.rerun()
+
         st.session_state.groq_key = st.text_input(
             "Groq API key",
             value=st.session_state.groq_key,
             type="password",
-            help="Required. Free at console.groq.com/keys.",
+            help="Free at console.groq.com/keys. Used for Groq + Whisper transcription.",
         )
         if st.session_state.groq_key:
             os.environ["GROQ_API_KEY"] = st.session_state.groq_key
+
+        st.session_state.anthropic_key = st.text_input(
+            "Anthropic API key",
+            value=st.session_state.anthropic_key,
+            type="password",
+            help="Get one at console.anthropic.com. Used when provider is set to Anthropic Claude.",
+        )
+        if st.session_state.anthropic_key:
+            os.environ["ANTHROPIC_API_KEY"] = st.session_state.anthropic_key
 
     with st.expander("My Context", expanded=False):
         st.caption("Save your brand voice, audience, product, or tech stack. Lens uses this on every analysis and Remix.")
