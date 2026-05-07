@@ -40,8 +40,13 @@ DEFAULTS = {
     "anthropic_key": os.environ.get("ANTHROPIC_API_KEY", ""),
     "provider": "groq",
     "my_context": "",
+    "target_kpis": "",
+    "reference_notes": "",
     "active_preset": None,
     "pending_custom_goal": False,
+    "pending_reply": False,
+    "processed_uploads": set(),
+    "upload_counter": 0,
     "data_root": None,
 }
 
@@ -112,14 +117,10 @@ def _render_log_entry(entry):
 
 def _ensure_api_key():
     if not _current_key():
-        provider_name = "Anthropic" if st.session_state.provider == "anthropic" else "Groq"
-        where = ("console.anthropic.com"
-                 if st.session_state.provider == "anthropic"
-                 else "console.groq.com/keys")
         st.session_state.display_log.append({
             "role": "assistant",
             "kind": "error",
-            "body": f"Add your {provider_name} API key in the sidebar to start. Get one at {where}.",
+            "body": "This Lens deployment isn't fully configured. Contact the team admin.",
         })
         st.rerun()
         return False
@@ -171,7 +172,7 @@ def _run_preset(preset, user_goal=""):
         "kind": "text",
         "body": f"**[{preset.label}]**\n\n{starter_text}",
     })
-    _stream_assistant_reply()
+    st.session_state.pending_reply = True
 
 
 def _run_followup(text):
@@ -180,14 +181,13 @@ def _run_followup(text):
     if not st.session_state.history:
         if not st.session_state.videos:
             st.session_state.display_log.append({"role": "assistant", "kind": "info", "body": "Drop a video URL or upload a file first."})
-            st.rerun()
             return
         _run_preset(PRESETS["custom_goal"], user_goal=text)
         return
     turn = _ai().build_followup_turn(text)
     st.session_state.history.append(turn)
     st.session_state.display_log.append({"role": "user", "kind": "text", "body": text})
-    _stream_assistant_reply()
+    st.session_state.pending_reply = True
 
 
 def _run_remix():
@@ -195,28 +195,26 @@ def _run_remix():
         return
     if not st.session_state.active_preset:
         st.session_state.display_log.append({"role": "assistant", "kind": "info", "body": "Run an analysis first, then I'll remix it for your context."})
-        st.rerun()
         return
     preset = PRESETS[st.session_state.active_preset]
     turn = _ai().build_remix_turn(preset)
     st.session_state.history.append(turn)
     st.session_state.display_log.append({"role": "user", "kind": "text", "body": "**[Remix for my context]**"})
-    _stream_assistant_reply()
+    st.session_state.pending_reply = True
 
 
 def _stream_assistant_reply():
+    """Stream the next assistant reply. Caller is responsible for ensuring the
+    full display_log has already been rendered above this call - this function
+    does NOT re-render past entries."""
     ai = _ai()
     try:
         client = ai.make_client(_current_key())
     except Exception as e:
         st.session_state.display_log.append({"role": "assistant", "kind": "error", "body": f"API key issue: {e}"})
-        st.rerun()
         return
 
     preset = PRESETS.get(st.session_state.active_preset) or PRESETS["custom_goal"]
-
-    for entry in st.session_state.display_log:
-        _render_log_entry(entry)
 
     with st.chat_message("assistant"):
         placeholder = st.empty()
@@ -227,9 +225,11 @@ def _stream_assistant_reply():
                 preset=preset,
                 my_context=st.session_state.my_context,
                 history=st.session_state.history,
+                target_kpis=st.session_state.target_kpis,
+                reference_notes=st.session_state.reference_notes,
             ):
                 accumulated += chunk
-                placeholder.markdown(accumulated + " ")
+                placeholder.markdown(accumulated + "▌")
             placeholder.markdown(accumulated)
         except Exception as e:
             placeholder.error(f"Streaming failed: {e}")
@@ -245,40 +245,40 @@ with st.sidebar:
 
     st.markdown("---")
 
-    with st.expander("AI provider & keys", expanded=not _current_key()):
+    # API keys load silently from Streamlit secrets / env vars - never exposed
+    # to the user. Provider is selected here but keys are not editable in the UI.
+    if st.session_state.groq_key:
+        os.environ["GROQ_API_KEY"] = st.session_state.groq_key
+    if st.session_state.anthropic_key:
+        os.environ["ANTHROPIC_API_KEY"] = st.session_state.anthropic_key
+
+    available_providers = []
+    if st.session_state.anthropic_key:
+        available_providers.append("anthropic")
+    if st.session_state.groq_key:
+        available_providers.append("groq")
+    if not available_providers:
+        available_providers = ["groq"]  # safe default; will surface key error on first use
+
+    if st.session_state.provider not in available_providers:
+        st.session_state.provider = available_providers[0]
+
+    if len(available_providers) > 1:
         provider_choice = st.radio(
-            "Provider",
-            options=["groq", "anthropic"],
-            index=0 if st.session_state.provider == "groq" else 1,
-            format_func=lambda x: ("Groq Llama (free, fast)"
-                                    if x == "groq"
-                                    else "Anthropic Claude (paid, sharper)"),
-            help="Switch the AI brain. Anthropic gives sharper analysis with per-frame vision but costs cents per request. Groq is free.",
+            "AI mode",
+            options=available_providers,
+            index=available_providers.index(st.session_state.provider),
+            format_func=lambda x: ("Sharper (Claude)"
+                                    if x == "anthropic"
+                                    else "Faster (Llama)"),
+            help="Sharper uses Anthropic Claude for stronger per-frame vision. Faster uses Groq Llama and is free.",
+            horizontal=True,
         )
         if provider_choice != st.session_state.provider:
-            # Switching providers invalidates history (different content-block formats).
             st.session_state.provider = provider_choice
             st.session_state.history = []
             st.session_state.active_preset = None
             st.rerun()
-
-        st.session_state.groq_key = st.text_input(
-            "Groq API key",
-            value=st.session_state.groq_key,
-            type="password",
-            help="Free at console.groq.com/keys. Used for Groq + Whisper transcription.",
-        )
-        if st.session_state.groq_key:
-            os.environ["GROQ_API_KEY"] = st.session_state.groq_key
-
-        st.session_state.anthropic_key = st.text_input(
-            "Anthropic API key",
-            value=st.session_state.anthropic_key,
-            type="password",
-            help="Get one at console.anthropic.com. Used when provider is set to Anthropic Claude.",
-        )
-        if st.session_state.anthropic_key:
-            os.environ["ANTHROPIC_API_KEY"] = st.session_state.anthropic_key
 
     with st.expander("My Context", expanded=False):
         st.caption("Save your brand voice, audience, product, or tech stack. Lens uses this on every analysis and Remix.")
@@ -298,6 +298,43 @@ with st.sidebar:
             label_visibility="collapsed",
         )
 
+    cal_active = bool(st.session_state.target_kpis.strip()
+                      or st.session_state.reference_notes.strip())
+    cal_label = "Calibration & KPIs ✓" if cal_active else "Calibration & KPIs"
+    with st.expander(cal_label, expanded=False):
+        st.caption(
+            "Reduces sycophancy. Without these, the AI grades against vibes — "
+            "polite by default. With KPI targets and reference videos, it grades "
+            "against measured reality."
+        )
+        st.session_state.target_kpis = st.text_area(
+            "Target KPIs for a successful video",
+            value=st.session_state.target_kpis,
+            height=110,
+            placeholder=(
+                "e.g.\n"
+                "- Scroll-stop rate: >40%\n"
+                "- Watch-through rate: >60%\n"
+                "- CTA click rate: >5%"
+            ),
+            help="What a 'good' video must measurably hit. The AI scores against these targets.",
+        )
+        st.session_state.reference_notes = st.text_area(
+            "Reference videos that already hit your targets",
+            value=st.session_state.reference_notes,
+            height=160,
+            placeholder=(
+                "Describe 2-4 successful videos and the metrics they hit. Example:\n\n"
+                "Reference 1: EON 'AI Fluency' Reel — 47% scroll-stop, 64% watch-through.\n"
+                "  Hooked with confident close-up + bold overlay 'Most teams use AI wrong.'\n"
+                "  Pattern interrupt at 4s: cut to product demo. CTA at 13s.\n\n"
+                "Reference 2: ..."
+            ),
+            help="Concrete benchmarks the AI uses as anchors when judging new videos.",
+        )
+        if cal_active:
+            st.caption("✓ Calibration is active. Every analysis will use these as guardrails.")
+
     st.markdown("### Videos in this session")
     if not st.session_state.videos:
         st.caption("No videos yet. Paste a URL or upload a file in the chat below.")
@@ -311,16 +348,50 @@ with st.sidebar:
             )
 
     st.markdown("---")
-    if st.button("Reset session", use_container_width=True):
-        for k in ("videos", "history", "display_log", "active_preset", "pending_custom_goal"):
+    if st.button("Reset session", use_container_width=True,
+                 help="Clears videos, chat history, and preset selection. Keeps your My Context, Calibration, and provider choice."):
+        for k in ("videos", "history", "display_log", "active_preset",
+                  "pending_custom_goal", "pending_reply"):
             st.session_state[k] = DEFAULTS[k]
+        st.session_state.processed_uploads = set()
+        # Bump the upload counter so the file_uploader widget remounts empty.
+        st.session_state.upload_counter += 1
         st.session_state.data_root = Path("data") / f"session-{uuid.uuid4().hex[:8]}"
         st.session_state.data_root.mkdir(parents=True, exist_ok=True)
         st.rerun()
 
 
 st.markdown('<div class="lens-brand" style="font-size:2rem"><span class="lens-dot"></span>Lens</div>', unsafe_allow_html=True)
-st.markdown('<div class="lens-tagline">Paste a video URL, upload a file, or ask a question.</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="lens-tagline">Turn any marketing or product video into a structured teardown — with insights re-written in your brand voice. '
+    '<b>1.</b> Drop a video URL or upload a file. '
+    '<b>2.</b> Pick a preset analysis. '
+    '<b>3.</b> Click <i>Remix</i> to translate the insights into your team\'s tone.</div>',
+    unsafe_allow_html=True,
+)
+
+with st.expander("What does each button do?", expanded=False):
+    st.markdown(
+        "**Marketing Hook Teardown** — full-video teardown for ads, Reels, Shorts, brand films. "
+        "1-10 verdict on the whole video, then walks the timeline section by section: "
+        "hook, body retention beats, climax, closing CTA, transferable structure. "
+        "Use it to dissect competitors' best ads or audit your own.\n\n"
+        "**Product Demo Review** — full demo walkthrough as if Claude were a target buyer who's never seen the product. "
+        "Tests 30-second comprehension, walks every feature beat by beat, flags drag/rush/dead-air, "
+        "outputs a timestamped issues list and the 3 highest-leverage improvements. "
+        "Use it to pressure-test EON product demos before publishing.\n\n"
+        "**Custom Goal** — type any specific objective and the analysis tunes itself to that goal "
+        "across the full video (e.g. *\"find me the strongest 5-second clip for a LinkedIn ad,\" "
+        "\"is this competitor's ROI claim defensible,\" \"give me three thumbnail concepts\"*). "
+        "Use it whenever the other presets don't match what you actually need.\n\n"
+        "**Competitive Compare** — side-by-side teardown across 2-3 videos in the same category. "
+        "Verdict matrix, dimension-by-dimension comparison, per-video takeaway, and the "
+        "**white-space opportunity** — what NEITHER video does that a third video could win on. "
+        "Load the videos into the session first, then run this preset.\n\n"
+        "**Remix for me** — after any analysis, click this to re-run it through your saved \"My Context\" (brand voice, audience, style). "
+        "Generic insights become EON-tone hook scripts, build specs, or beat-the-competitor scripts. "
+        "This is what turns the tool from analysis into applied insight."
+    )
 
 
 st.markdown('<div class="lens-chip-anchor"></div>', unsafe_allow_html=True)
@@ -336,26 +407,55 @@ for col, key in zip(chip_cols[:4], chip_keys):
             _run_preset(preset)
             st.rerun()
 with chip_cols[4]:
-    if st.button("Remix for me", key="chip_remix", help="Reverse-engineer the analyzed video into something tuned for your brand or stack.", use_container_width=True, disabled=not st.session_state.active_preset):
+    remix_help = (
+        "Re-runs the most recent analysis through your My Context (brand voice, audience, style). "
+        "Turns generic AI output into EON-tone deliverables. Run a preset first to enable this."
+    )
+    if st.button("Remix for me", key="chip_remix", help=remix_help, use_container_width=True, disabled=not st.session_state.active_preset):
         _run_remix()
         st.rerun()
 
 
 with st.expander("Upload a local video file"):
-    upload = st.file_uploader("Drop an MP4, MOV, MKV, or WebM", type=["mp4", "mov", "mkv", "webm"], label_visibility="collapsed")
+    # The widget key includes a counter that bumps after every successful
+    # upload. Bumping the key forces Streamlit to mount a fresh, EMPTY
+    # uploader, so the file you just processed disappears from the widget
+    # and you can upload another one without manually clicking the X.
+    upload_widget_key = f"video_upload_widget_{st.session_state.upload_counter}"
+    upload = st.file_uploader(
+        "Drop an MP4, MOV, MKV, or WebM",
+        type=["mp4", "mov", "mkv", "webm"],
+        label_visibility="collapsed",
+        key=upload_widget_key,
+    )
     if upload is not None:
-        target = st.session_state.data_root / f"upload-{int(time.time())}-{upload.name}"
-        target.write_bytes(upload.read())
-        with st.spinner("Processing uploaded video..."):
-            v = _process_video(str(target))
-        if v:
-            st.session_state.videos.append(v)
-            st.session_state.display_log.append({"role": "user", "kind": "video", "video": v})
-            st.rerun()
+        # Defense-in-depth: even though we bump the counter on success,
+        # also dedupe by (name, size) signature in case Streamlit reruns
+        # the script before the counter takes effect.
+        upload_sig = f"{upload.name}-{upload.size}"
+        if upload_sig not in st.session_state.processed_uploads:
+            st.session_state.processed_uploads.add(upload_sig)
+            target = st.session_state.data_root / f"upload-{int(time.time())}-{upload.name}"
+            target.write_bytes(upload.read())
+            with st.spinner("Processing uploaded video..."):
+                v = _process_video(str(target))
+            if v:
+                st.session_state.videos.append(v)
+                st.session_state.display_log.append({"role": "user", "kind": "video", "video": v})
+                # Bump counter so the next render mounts a fresh empty uploader.
+                st.session_state.upload_counter += 1
+                st.rerun()
 
 
 for entry in st.session_state.display_log:
     _render_log_entry(entry)
+
+
+# If a user action just queued an assistant reply, stream it now (after all
+# past entries have rendered above). Streaming once per turn, no duplicates.
+if st.session_state.pending_reply:
+    st.session_state.pending_reply = False
+    _stream_assistant_reply()
 
 
 if st.session_state.pending_custom_goal:

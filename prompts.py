@@ -44,7 +44,7 @@ pad with filler. Concrete observations beat generic praise.
 MARKETING_HOOK = Preset(
     key="marketing_hook",
     label="Marketing Hook Teardown",
-    short_blurb="Full-video teardown: hook, retention beats, climax, CTA, and the transferable structure.",
+    short_blurb="Use for ads, Reels, Shorts, brand films. Returns 1-10 verdict + full timeline walkthrough: hook, retention beats, climax, CTA, transferable structure.",
     system_prompt=_BASE_VOICE + """
 You specialize in marketing video analysis (ads, Reels, Shorts, long-form
 brand content). You break down WHY a video earns AND keeps attention
@@ -120,7 +120,7 @@ Deliver:
 PRODUCT_DEMO = Preset(
     key="product_demo",
     label="Product Demo Review",
-    short_blurb="Full demo walkthrough: clarity, pacing, drop-off risks, cut/add list, top improvements.",
+    short_blurb="Use for software / product demo videos. Walks every feature, flags drag/rush moments, returns timestamped issues list + top 3 improvements that move conversion.",
     system_prompt=_BASE_VOICE + """
 You specialize in product demo and UX walkthrough critique. Your job is
 to make the demo more saleable, clearer, and shorter - across its FULL
@@ -194,7 +194,7 @@ transcript:
 CUSTOM_GOAL = Preset(
     key="custom_goal",
     label="Custom Goal",
-    short_blurb="You type the goal - the analysis covers the whole video, tuned to your objective.",
+    short_blurb="Use when the other presets don't fit. Type any specific objective (e.g. \"find the strongest 5-sec clip for LinkedIn\") and analysis tunes to your goal.",
     system_prompt=_BASE_VOICE + """
 The user has a specific goal for analyzing this video. Read their goal
 carefully and tune your entire analysis to that goal. Skip generic
@@ -237,7 +237,7 @@ brand, stack, or audience.\
 COMPETITIVE_COMPARE = Preset(
     key="competitive_compare",
     label="Competitive Compare",
-    short_blurb="Drop 2-3 videos: side-by-side full-video teardown across hook, body, pacing, visuals, claims, CTAs.",
+    short_blurb="Use to benchmark against competitors. Load 2-3 videos in the session first, then run: side-by-side teardown + the white-space opportunity neither covered.",
     system_prompt=_BASE_VOICE + """
 You are comparing 2 or 3 videos. Each one will be presented to you in
 order, with its own transcript and frames. Treat them as competitors in
@@ -320,3 +320,45 @@ The user's saved context (brand, audience, product, tech stack):
 {my_context.strip()}
 ---
 """
+
+
+def calibration_block(target_kpis: str, reference_notes: str) -> str:
+    """Inject KPI targets and reference benchmarks as judgment guardrails.
+
+    Without this, the model tends toward polite/generic verdicts. With
+    measured KPI targets and proven reference videos, scoring is anchored
+    to reality — a "7/10 hook" becomes "would hit the user's >40% scroll-stop
+    target" rather than "feels pretty good." This is the anti-sycophancy
+    layer.
+    """
+    target_kpis = (target_kpis or "").strip()
+    reference_notes = (reference_notes or "").strip()
+    if not target_kpis and not reference_notes:
+        return ""
+    parts = [
+        "",
+        "---",
+        "CALIBRATION GUARDRAILS — read these before scoring or judging.",
+        "",
+        "Anchor every verdict to the data below. Do not score against generic",
+        "standards or a vague sense of \"good.\" If your verdict drifts toward",
+        "politeness, hedging, or vague encouragement, return to these and",
+        "recalibrate. The user explicitly does NOT want chatbot-style flattery.",
+        "Be willing to say a video underperforms if the evidence supports it.",
+    ]
+    if target_kpis:
+        parts.extend([
+            "",
+            "Target KPIs (what a successful video for this user must hit):",
+            target_kpis,
+        ])
+    if reference_notes:
+        parts.extend([
+            "",
+            "Reference videos that have already hit similar targets",
+            "(use these as objective benchmarks — if the analyzed video lacks",
+            "the moves these references made, say so):",
+            reference_notes,
+        ])
+    parts.append("---")
+    return "\n".join(parts)

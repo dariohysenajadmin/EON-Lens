@@ -21,7 +21,7 @@ from typing import Iterable, Optional
 import anthropic
 
 from lens_video import VideoData
-from prompts import Preset, context_block
+from prompts import Preset, context_block, calibration_block
 
 
 # Claude model IDs - update as Anthropic releases new ones.
@@ -134,11 +134,15 @@ def stream_response(
     preset: Preset,
     my_context: str,
     history: list[ChatTurn],
+    target_kpis: str = "",
+    reference_notes: str = "",
     model: str = DEFAULT_MODEL,
     max_tokens: int = DEFAULT_MAX_TOKENS,
 ) -> Iterable[str]:
     """Stream tokens for the next assistant reply via Anthropic's Messages API."""
-    system = preset.system_prompt + context_block(my_context)
+    system = (preset.system_prompt
+              + context_block(my_context)
+              + calibration_block(target_kpis, reference_notes))
 
     messages = []
     for t in history:

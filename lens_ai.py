@@ -18,7 +18,7 @@ from typing import Iterable, Optional
 from groq import Groq
 
 from lens_video import VideoData
-from prompts import Preset, context_block
+from prompts import Preset, context_block, calibration_block
 
 
 # Groq model ids change occasionally. Pick the strongest vision-capable model
@@ -122,6 +122,8 @@ def stream_response(
     preset: Preset,
     my_context: str,
     history: list[ChatTurn],
+    target_kpis: str = "",
+    reference_notes: str = "",
     model: str = DEFAULT_MODEL,
     max_tokens: int = DEFAULT_MAX_TOKENS,
 ) -> Iterable[str]:
@@ -130,7 +132,9 @@ def stream_response(
     Tries DEFAULT_MODEL first; on model-not-found errors, falls back through
     FALLBACK_MODELS so the app keeps working as Groq's catalog rotates.
     """
-    system = preset.system_prompt + context_block(my_context)
+    system = (preset.system_prompt
+              + context_block(my_context)
+              + calibration_block(target_kpis, reference_notes))
 
     messages = [{"role": "system", "content": system}]
     for t in history:
@@ -177,4 +181,3 @@ def stream_response(
 def _clock(seconds: float) -> str:
     s = int(seconds)
     return f"{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
-   
