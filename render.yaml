@@ -1,0 +1,25 @@
+# Render blueprint for Lens.
+# Push this file to GitHub and Render will auto-detect it on import.
+# Docs: https://render.com/docs/blueprint-spec
+
+services:
+  - type: web
+    name: lens
+    runtime: docker
+    plan: free
+    # frankfurt is closer to Albania/EU than oregon. Change if you prefer
+    # ohio or singapore.
+    region: frankfurt
+    healthCheckPath: /
+    envVars:
+      # The actual values are set in the Render dashboard, not in the repo.
+      # `sync: false` tells Render not to expect the value from this file.
+      - key: GROQ_API_KEY
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: SUPADATA_API_KEY
+        sync: false
+      # Optional: if you ever need the app to know what URL it's running at
+      # - key: PUBLIC_URL
+      #   sync: false
