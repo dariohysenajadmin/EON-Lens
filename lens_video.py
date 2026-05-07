@@ -126,7 +126,11 @@ def _resolve_source(source, tmpdir, say):
             yt = _try_supadata(source, tmpdir, say)
             if yt:
                 return yt
-            say("Supadata failed, trying yt-dlp fallback...")
+            say("Supadata failed, trying Cobalt + Whisper fallback...")
+            yt = _try_cobalt(source, tmpdir, say)
+            if yt:
+                return yt
+            say("Cobalt failed, trying yt-dlp as last resort...")
         return _download_url(source, tmpdir, say)
 
     p = Path(source).expanduser().resolve()
@@ -259,6 +263,156 @@ def _try_supadata(url, tmpdir, say):
         "title": title, "video_id": yt_id, "duration": total_duration,
         "video_path": None, "captions_path": captions_path,
         "thumbnail_path": thumb_path, "is_supadata": True,
+        "preloaded_cues": cues,
+    }
+
+
+def _try_cobalt(url, tmpdir, say):
+    """Bypass YouTube bot-flagging via Cobalt's open-source downloader API.
+
+    Cobalt (cobalt.tools) handles YouTube's bot detection server-side and
+    returns a clean direct-download URL. We fetch the audio, run it through
+    our existing Groq Whisper transcription, and use the YouTube thumbnail
+    as the visual reference (same pattern as the Supadata path).
+
+    Note: api.cobalt.tools is a community-run public instance with rate
+    limits and bot protection. For heavy production use, self-host Cobalt
+    on your own server (it's a small Node.js app).
+    """
+    import requests
+
+    m = re.search(r"(?:v=|/embed/|/shorts/|/v/|youtu\.be/)([0-9A-Za-z_-]{11})", url)
+    if not m:
+        say("Could not parse YouTube ID from URL.")
+        return None
+    yt_id = m.group(1)
+
+    say(f"Calling Cobalt API for audio download of {yt_id}...")
+    try:
+        r = requests.post(
+            "https://api.cobalt.tools/",
+            json={
+                "url": url,
+                "downloadMode": "audio",
+                "audioFormat": "mp3",
+                "audioBitrate": "128",
+            },
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "User-Agent": "lens-video-intel/1.0",
+            },
+            timeout=45,
+        )
+    except Exception as e:
+        say(f"Cobalt request failed: {e}")
+        return None
+
+    if r.status_code not in (200, 201):
+        say(f"Cobalt returned HTTP {r.status_code}: {r.text[:300]}")
+        return None
+
+    try:
+        data = r.json()
+    except Exception as e:
+        say(f"Cobalt JSON parse failed: {e}; body: {r.text[:200]}")
+        return None
+
+    status = (data.get("status") or "").lower()
+
+    if status == "error":
+        err = data.get("error") or {}
+        code = err.get("code") if isinstance(err, dict) else str(err)
+        say(f"Cobalt error: {code}")
+        return None
+
+    # Cobalt returns 'tunnel' (proxied download) or 'redirect' (direct CDN URL)
+    # for simple audio cases. 'picker' and 'local-processing' are more complex
+    # and we treat as failure for v1.
+    if status not in ("tunnel", "redirect"):
+        say(f"Cobalt returned unsupported status '{status}' (need tunnel or redirect).")
+        return None
+
+    download_url = data.get("url")
+    if not download_url:
+        say("Cobalt response missing download URL.")
+        return None
+
+    say("Downloading audio from Cobalt...")
+    audio_path = tmpdir / f"{yt_id}_cobalt.mp3"
+    try:
+        with requests.get(
+            download_url,
+            stream=True,
+            timeout=180,
+            headers={"User-Agent": "lens-video-intel/1.0"},
+        ) as audio_resp:
+            audio_resp.raise_for_status()
+            with audio_path.open("wb") as f:
+                for chunk in audio_resp.iter_content(chunk_size=65536):
+                    if chunk:
+                        f.write(chunk)
+    except Exception as e:
+        say(f"Audio download failed: {e}")
+        return None
+
+    if not audio_path.exists() or audio_path.stat().st_size < 5000:
+        say("Cobalt audio file is empty or truncated.")
+        return None
+
+    size_kb = audio_path.stat().st_size // 1024
+    say(f"Got {size_kb}KB audio. Transcribing with Groq Whisper...")
+    try:
+        cues = _whisper_groq(audio_path)
+    except Exception as e:
+        say(f"Whisper transcription failed: {e}")
+        return None
+
+    if not cues:
+        say("Whisper returned no transcript segments.")
+        return None
+    say(f"Whisper produced {len(cues)} transcript segments.")
+
+    # Title via YouTube's oEmbed (works without auth)
+    title = yt_id
+    try:
+        oembed = requests.get(
+            f"https://www.youtube.com/oembed?url={url}&format=json", timeout=10
+        )
+        if oembed.status_code == 200:
+            title = oembed.json().get("title", yt_id)
+    except Exception:
+        pass
+
+    # Thumbnail for visual reference
+    say("Fetching thumbnail...")
+    thumb_path = tmpdir / f"{yt_id}_thumb.jpg"
+    for variant in ("maxresdefault", "sddefault", "hqdefault", "mqdefault"):
+        try:
+            tr = requests.get(
+                f"https://img.youtube.com/vi/{yt_id}/{variant}.jpg", timeout=15
+            )
+            if tr.status_code == 200 and len(tr.content) > 1000:
+                thumb_path.write_bytes(tr.content)
+                break
+        except Exception:
+            continue
+    if not thumb_path.exists():
+        say("Could not fetch YouTube thumbnail.")
+        return None
+
+    total_duration = max((c.end for c in cues), default=0.0)
+    captions_path = tmpdir / f"{yt_id}.vtt"
+    _write_cues_as_vtt(cues, captions_path)
+
+    return {
+        "title": title,
+        "video_id": yt_id,
+        "duration": total_duration,
+        "video_path": None,
+        "captions_path": captions_path,
+        "thumbnail_path": thumb_path,
+        "is_supadata": True,  # reuses the thumbnail-only frame path in extract_video_data
         "preloaded_cues": cues,
     }
 
