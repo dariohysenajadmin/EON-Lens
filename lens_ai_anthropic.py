@@ -32,9 +32,11 @@ FALLBACK_MODELS = [
 ]
 DEFAULT_MAX_TOKENS = 4096
 
-# Cap individual-frame uploads so we don't blow request size or rate limits.
-# Claude can handle many images but the API request body has a soft cap.
-MAX_FRAMES_PER_VIDEO = 20
+# Cap per-video frame uploads. Claude handles many images natively, but on
+# small-RAM hosts (e.g. Render free tier at 512MB) holding 20+ base64-encoded
+# JPEGs in memory while building the request can push the container into OOM.
+# 12 frames still gives strong temporal coverage of any video under ~10 min.
+MAX_FRAMES_PER_VIDEO = 12
 
 
 @dataclass
