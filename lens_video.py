@@ -287,10 +287,17 @@ def _try_cobalt(url, tmpdir, say):
         return None
     yt_id = m.group(1)
 
-    say(f"Calling Cobalt API for audio download of {yt_id}...")
+    # Prefer a self-hosted Cobalt URL via env var. The public api.cobalt.tools
+    # now requires Turnstile auth, so it won't work without it. Self-hosted
+    # instances are open by default.
+    cobalt_base = os.environ.get("COBALT_API_URL", "https://api.cobalt.tools/")
+    if not cobalt_base.endswith("/"):
+        cobalt_base += "/"
+
+    say(f"Calling Cobalt API ({cobalt_base}) for audio download of {yt_id}...")
     try:
         r = requests.post(
-            "https://api.cobalt.tools/",
+            cobalt_base,
             json={
                 "url": url,
                 "downloadMode": "audio",
