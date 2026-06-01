@@ -1,13 +1,15 @@
 """
 Lens - the video intelligence app.
+
 Run with: streamlit run app.py
 """
 
 from __future__ import annotations
-
 import os
 import re
+import sys
 import time
+import traceback
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -20,7 +22,6 @@ import lens_ai as _ai_groq
 import lens_ai_anthropic as _ai_anthropic
 from prompts import PRESETS, Preset
 from theme import apply_theme
-
 
 load_dotenv()
 
@@ -69,6 +70,7 @@ def _current_key():
             if st.session_state.provider == "anthropic"
             else st.session_state.groq_key)
 
+
 for k, v in DEFAULTS.items():
     st.session_state.setdefault(k, v)
 
@@ -76,9 +78,7 @@ if st.session_state.data_root is None:
     st.session_state.data_root = Path("data") / f"session-{uuid.uuid4().hex[:8]}"
     st.session_state.data_root.mkdir(parents=True, exist_ok=True)
 
-
 st.markdown(apply_theme(st.session_state.theme), unsafe_allow_html=True)
-
 
 URL_RE = re.compile(r"https?://\S+")
 
@@ -130,9 +130,11 @@ def _ensure_api_key():
 def _process_video(source):
     placeholder = st.empty()
     progress_log = []
+
     def progress(msg):
         progress_log.append(msg)
         placeholder.info(msg)
+
     try:
         video = extract_video_data(source, max_frames=30, output_root=st.session_state.data_root, progress=progress)
         placeholder.empty()
@@ -159,11 +161,9 @@ def _run_preset(preset, user_goal=""):
         })
         st.rerun()
         return
-
     initial = _ai().build_initial_turn(videos=st.session_state.videos, preset=preset, user_goal=user_goal)
     st.session_state.history = [initial]
     st.session_state.active_preset = preset.key
-
     starter_text = preset.starter_prompt
     if user_goal:
         starter_text += f"\n\n**Your goal:** {user_goal}"
@@ -213,9 +213,7 @@ def _stream_assistant_reply():
     except Exception as e:
         st.session_state.display_log.append({"role": "assistant", "kind": "error", "body": f"API key issue: {e}"})
         return
-
     preset = PRESETS.get(st.session_state.active_preset) or PRESETS["custom_goal"]
-
     with st.chat_message("assistant"):
         placeholder = st.empty()
         accumulated = ""
@@ -232,9 +230,21 @@ def _stream_assistant_reply():
                 placeholder.markdown(accumulated + "▌")
             placeholder.markdown(accumulated)
         except Exception as e:
-            placeholder.error(f"Streaming failed: {e}")
+            # Surface the exception class so "Connection error." (which is
+            # the bare-string repr of anthropic.APIConnectionError) becomes
+            # something diagnosable from the UI.
+            err_type = type(e).__name__
+            placeholder.error(
+                f"Analysis failed ({err_type}): {e}\n\n"
+                "Click the preset again to retry. The provider auto-retries "
+                "on transient connection errors, but a hard timeout still "
+                "shows up here."
+            )
+            # Full traceback goes to stderr so it lands in Render's logs.
+            print(f"[lens] _stream_assistant_reply failed: {err_type}: {e}",
+                  file=sys.stderr, flush=True)
+            traceback.print_exc(file=sys.stderr)
             return
-
     st.session_state.history.append(ai.build_assistant_turn(accumulated))
     st.session_state.display_log.append({"role": "assistant", "kind": "text", "body": accumulated})
 
@@ -242,7 +252,6 @@ def _stream_assistant_reply():
 with st.sidebar:
     st.markdown('<div class="lens-brand"><span class="lens-dot"></span>Lens</div>', unsafe_allow_html=True)
     st.markdown('<div class="lens-tagline">Video intelligence for marketing & product teams.</div>', unsafe_allow_html=True)
-
     st.markdown("---")
 
     # API keys load silently from Streamlit secrets / env vars - never exposed
@@ -259,7 +268,6 @@ with st.sidebar:
         available_providers.append("groq")
     if not available_providers:
         available_providers = ["groq"]  # safe default; will surface key error on first use
-
     if st.session_state.provider not in available_providers:
         st.session_state.provider = available_providers[0]
 
@@ -269,8 +277,8 @@ with st.sidebar:
             options=available_providers,
             index=available_providers.index(st.session_state.provider),
             format_func=lambda x: ("Sharper (Claude)"
-                                    if x == "anthropic"
-                                    else "Faster (Llama)"),
+                                   if x == "anthropic"
+                                   else "Faster (Llama)"),
             help="Sharper uses Anthropic Claude for stronger per-frame vision. Faster uses Groq Llama and is free.",
             horizontal=True,
         )
@@ -393,7 +401,6 @@ with st.expander("What does each button do?", expanded=False):
         "This is what turns the tool from analysis into applied insight."
     )
 
-
 st.markdown('<div class="lens-chip-anchor"></div>', unsafe_allow_html=True)
 chip_cols = st.columns(5)
 chip_keys = ["marketing_hook", "product_demo", "custom_goal", "competitive_compare"]
@@ -434,22 +441,25 @@ with st.expander("Upload a local video file"):
         # the script before the counter takes effect.
         upload_sig = f"{upload.name}-{upload.size}"
         if upload_sig not in st.session_state.processed_uploads:
-            st.session_state.processed_uploads.add(upload_sig)
             target = st.session_state.data_root / f"upload-{int(time.time())}-{upload.name}"
             target.write_bytes(upload.read())
             with st.spinner("Processing uploaded video..."):
                 v = _process_video(str(target))
-            if v:
-                st.session_state.videos.append(v)
-                st.session_state.display_log.append({"role": "user", "kind": "video", "video": v})
-                # Bump counter so the next render mounts a fresh empty uploader.
-                st.session_state.upload_counter += 1
-                st.rerun()
+                if v:
+                    # Only mark as processed on SUCCESS. Previously this was
+                    # set unconditionally before _process_video ran, so a
+                    # failed extraction would poison the dedup set and the
+                    # user had to upload the file a second time to bypass it.
+                    st.session_state.processed_uploads.add(upload_sig)
+                    st.session_state.videos.append(v)
+                    st.session_state.display_log.append({"role": "user", "kind": "video", "video": v})
+                    # Bump counter so the next render mounts a fresh empty uploader.
+                    st.session_state.upload_counter += 1
+                    st.rerun()
 
 
 for entry in st.session_state.display_log:
     _render_log_entry(entry)
-
 
 # If a user action just queued an assistant reply, stream it now (after all
 # past entries have rendered above). Streaming once per turn, no duplicates.
@@ -479,7 +489,6 @@ placeholder_text = (
     if st.session_state.videos
     else "Paste a video URL to start (YouTube, Loom, Vimeo, Reel, raw MP4...)"
 )
-
 if msg := st.chat_input(placeholder_text):
     msg = msg.strip()
     url_match = URL_RE.search(msg)
@@ -487,14 +496,14 @@ if msg := st.chat_input(placeholder_text):
         url = url_match.group(0).rstrip(",.;)")
         with st.spinner(f"Processing {url}..."):
             v = _process_video(url)
-        if v:
-            st.session_state.videos.append(v)
-            st.session_state.display_log.append({"role": "user", "kind": "video", "video": v})
-            extra = URL_RE.sub("", msg).strip()
-            if extra:
-                st.session_state.display_log.append({"role": "user", "kind": "text", "body": extra})
-                _run_preset(PRESETS["custom_goal"], user_goal=extra)
-        st.rerun()
+            if v:
+                st.session_state.videos.append(v)
+                st.session_state.display_log.append({"role": "user", "kind": "video", "video": v})
+                extra = URL_RE.sub("", msg).strip()
+                if extra:
+                    st.session_state.display_log.append({"role": "user", "kind": "text", "body": extra})
+                    _run_preset(PRESETS["custom_goal"], user_goal=extra)
+                st.rerun()
     else:
         _run_followup(msg)
         st.rerun()
